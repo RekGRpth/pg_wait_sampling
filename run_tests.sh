@@ -19,11 +19,11 @@ if [ "$CHECK_CODE" = "clang" ]; then
 
 elif [ "$CHECK_CODE" = "cppcheck" ]; then
     cppcheck \
-		--template "{file} ({line}): {severity} ({id}): {message}" \
+        --template "{file} ({line}): {severity} ({id}): {message}" \
         --enable=warning,portability,performance \
         --suppress=redundantAssignment \
         --suppress=uselessAssignmentPtrArg \
-		--suppress=literalWithCharPtrCompare \
+        --suppress=literalWithCharPtrCompare \
         --suppress=incorrectStringBooleanError \
         --std=c89 *.c *.h 2> cppcheck.log
 
@@ -48,7 +48,7 @@ make USE_PGXS=1 install
 status=$?
 if [ $status -ne 0 ]; then exit $status; fi
 
-# add pg_pathman to shared_preload_libraries and restart cluster 'test'
+# add pg_wait_sampling to shared_preload_libraries and restart cluster 'test'
 echo "shared_preload_libraries = 'pg_wait_sampling'" >> $PGDATA/postgresql.conf
 echo "port = 55435" >> $PGDATA/postgresql.conf
 pg_ctl start -l /tmp/postgres.log -w

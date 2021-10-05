@@ -10,6 +10,9 @@
 #include "postgres.h"
 
 #include "catalog/pg_type.h"
+#if PG_VERSION_NUM >= 130000
+#include "common/hashfn.h"
+#endif
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -210,15 +213,35 @@ send_history(History *observations, shm_mq_handle *mqh)
 {
 	Size	count,
 			i;
+	shm_mq_result	mq_result;
 
 	if (observations->wraparound)
 		count = observations->count;
 	else
 		count = observations->index;
 
-	shm_mq_send(mqh, sizeof(count), &count, false);
+	mq_result = shm_mq_send(mqh, sizeof(count), &count, false);
+	if (mq_result == SHM_MQ_DETACHED)
+	{
+		ereport(WARNING,
+				(errmsg("pg_wait_sampling collector: "
+						"receiver of message queue has been detached")));
+		return;
+	}
 	for (i = 0; i < count; i++)
-		shm_mq_send(mqh, sizeof(HistoryItem), &observations->items[i], false);
+	{
+		mq_result = shm_mq_send(mqh,
+								sizeof(HistoryItem),
+								&observations->items[i],
+								false);
+		if (mq_result == SHM_MQ_DETACHED)
+		{
+			ereport(WARNING,
+					(errmsg("pg_wait_sampling collector: "
+							"receiver of message queue has been detached")));
+			return;
+		}
+	}
 }
 
 /*
@@ -230,12 +253,28 @@ send_profile(HTAB *profile_hash, shm_mq_handle *mqh)
 	HASH_SEQ_STATUS	scan_status;
 	ProfileItem	   *item;
 	Size			count = hash_get_num_entries(profile_hash);
+	shm_mq_result	mq_result;
 
-	shm_mq_send(mqh, sizeof(count), &count, false);
+	mq_result = shm_mq_send(mqh, sizeof(count), &count, false);
+	if (mq_result == SHM_MQ_DETACHED)
+	{
+		ereport(WARNING,
+				(errmsg("pg_wait_sampling collector: "
+						"receiver of message queue has been detached")));
+		return;
+	}
 	hash_seq_init(&scan_status, profile_hash);
 	while ((item = (ProfileItem *) hash_seq_search(&scan_status)) != NULL)
 	{
-		shm_mq_send(mqh, sizeof(ProfileItem), item, false);
+		mq_result = shm_mq_send(mqh, sizeof(ProfileItem), item, false);
+		if (mq_result == SHM_MQ_DETACHED)
+		{
+			hash_seq_term(&scan_status);
+			ereport(WARNING,
+					(errmsg("pg_wait_sampling collector: "
+							"receiver of message queue has been detached")));
+			return;
+		}
 	}
 }
 
@@ -267,11 +306,11 @@ static int64
 millisecs_diff(TimestampTz tz1, TimestampTz tz2)
 {
 	long	secs;
-	int		millisecs;
+	int		microsecs;
 
-	TimestampDifference(tz1, tz2, &secs, &millisecs);
+	TimestampDifference(tz1, tz2, &secs, &microsecs);
 
-	return secs * 1000 + millisecs;
+	return secs * 1000 + microsecs / 1000;
 
 }
 
@@ -281,7 +320,7 @@ millisecs_diff(TimestampTz tz1, TimestampTz tz2)
 void
 collector_main(Datum main_arg)
 {
- 	HTAB		   *profile_hash = NULL;
+	HTAB		   *profile_hash = NULL;
 	History			observations;
 	MemoryContext	old_context,
 					collector_context;
@@ -302,6 +341,16 @@ collector_main(Datum main_arg)
 	pqsignal(SIGTERM, handle_sigterm);
 	BackgroundWorkerUnblockSignals();
 
+#if PG_VERSION_NUM >= 110000
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL, false);
+#else
+	InitPostgres(NULL, InvalidOid, NULL, InvalidOid, NULL);
+#endif
+	SetProcessingMode(NormalProcessing);
+
+	/* Make pg_wait_sampling recognisable in pg_stat_activity */
+	pgstat_report_appname("pg_wait_sampling collector");
+
 	profile_hash = make_profile_hash();
 	collector_hdr->latch = &MyProc->procLatch;
 
@@ -311,6 +360,8 @@ collector_main(Datum main_arg)
 	old_context = MemoryContextSwitchTo(collector_context);
 	alloc_history(&observations, collector_hdr->historySize);
 	MemoryContextSwitchTo(old_context);
+
+	ereport(LOG, (errmsg("pg_wait_sampling collector started")));
 
 	/* Start counting time for history and profile samples */
 	profile_ts = history_ts = GetCurrentTimestamp();
@@ -391,26 +442,37 @@ collector_main(Datum main_arg)
 
 			if (request == HISTORY_REQUEST || request == PROFILE_REQUEST)
 			{
+				shm_mq_result	mq_result;
+
 				/* Send history or profile */
 				shm_mq_set_sender(collector_mq, MyProc);
 				mqh = shm_mq_attach(collector_mq, NULL, NULL);
-				shm_mq_wait_for_attach(mqh);
-				if (shm_mq_get_receiver(collector_mq) != NULL)
+				mq_result = shm_mq_wait_for_attach(mqh);
+				switch (mq_result)
 				{
-					if (request == HISTORY_REQUEST)
-					{
-						send_history(&observations, mqh);
-					}
-					else if (request == PROFILE_REQUEST)
-					{
-						send_profile(profile_hash, mqh);
-					}
+					case SHM_MQ_SUCCESS:
+						switch (request)
+						{
+							case HISTORY_REQUEST:
+								send_history(&observations, mqh);
+								break;
+							case PROFILE_REQUEST:
+								send_profile(profile_hash, mqh);
+								break;
+							default:
+								AssertState(false);
+						}
+						break;
+					case SHM_MQ_DETACHED:
+						ereport(WARNING,
+								(errmsg("pg_wait_sampling collector: "
+										"receiver of message queue have been "
+										"detached")));
+						break;
+					default:
+						AssertState(false);
 				}
-#if PG_VERSION_NUM >= 100000
-				shm_mq_detach(mqh);
-#else
-				shm_mq_detach(collector_mq);
-#endif
+				shm_mq_detach_compat(mqh, collector_mq);
 			}
 			else if (request == PROFILE_RESET)
 			{
@@ -430,5 +492,6 @@ collector_main(Datum main_arg)
 	 * on_dsm_detach callbacks we've registered, as well.  Once that's done,
 	 * we can go ahead and exit.
 	 */
+	ereport(LOG, (errmsg("pg_wait_sampling collector shutting down")));
 	proc_exit(0);
 }

@@ -8,24 +8,27 @@
  *	  contrib/pg_wait_sampling/pg_wait_sampling.c
  */
 #include "postgres.h"
-#include "fmgr.h"
-#include "funcapi.h"
+
 #include "access/htup_details.h"
 #include "access/twophase.h"
 #include "catalog/pg_type.h"
+#include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
-#include "storage/spin.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/procarray.h"
 #include "storage/shm_mq.h"
 #include "storage/shm_toc.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
-#include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/guc.h"
+#include "utils/memutils.h" /* TopMemoryContext.  Actually for PG 9.6 only,
+							 * but there should be no harm for others. */
 
 #include "pg_wait_sampling.h"
 
@@ -47,9 +50,17 @@ shm_mq				   *collector_mq = NULL;
 uint64				   *proc_queryids = NULL;
 CollectorShmqHeader	   *collector_hdr = NULL;
 
+/* Receiver (backend) local shm_mq pointers and lock */
+shm_mq		   *recv_mq = NULL;
+shm_mq_handle  *recv_mqh = NULL;
+LOCKTAG			queueTag;
+
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static PGPROC * search_proc(int backendPid);
 static PlannedStmt *pgws_planner_hook(Query *parse,
+#if PG_VERSION_NUM >= 130000
+		const char *query_string,
+#endif
 		int cursorOptions, ParamListInfo boundParams);
 static void pgws_ExecutorEnd(QueryDesc *queryDesc);
 
@@ -287,6 +298,14 @@ check_shmem(void)
 	}
 }
 
+static void
+pgws_cleanup_callback(int code, Datum arg)
+{
+	elog(DEBUG3, "pg_wait_sampling cleanup: detaching shm_mq and releasing queue lock");
+	shm_mq_detach_compat(recv_mqh, recv_mq);
+	LockRelease(&queueTag, ExclusiveLock, false);
+}
+
 /*
  * Module load callback
  */
@@ -380,7 +399,7 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 		params->ts = GetCurrentTimestamp();
 
 		funcctx->user_fctx = params;
-		tupdesc = CreateTemplateTupleDesc(4, false);
+		tupdesc = CreateTemplateTupleDescCompat(4, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "type",
@@ -496,16 +515,14 @@ init_lock_tag(LOCKTAG *tag, uint32 lock)
 static void *
 receive_array(SHMRequest request, Size item_size, Size *count)
 {
-	LOCKTAG			queueTag;
 	LOCKTAG			collectorTag;
-	shm_mq		   *mq;
-	shm_mq_handle  *mqh;
 	shm_mq_result	res;
 	Size			len,
 					i;
 	void		   *data;
 	Pointer			result,
 					ptr;
+	MemoryContext	oldctx;
 
 	/* Ensure nobody else trying to send request to queue */
 	init_lock_tag(&queueTag, PGWS_QUEUE_LOCK);
@@ -516,7 +533,7 @@ receive_array(SHMRequest request, Size item_size, Size *count)
 	LockAcquire(&collectorTag, ExclusiveLock, false, false);
 	LockRelease(&collectorTag, ExclusiveLock, false);
 
-	mq = shm_mq_create(collector_mq, COLLECTOR_QUEUE_SIZE);
+	recv_mq = shm_mq_create(collector_mq, COLLECTOR_QUEUE_SIZE);
 	collector_hdr->request = request;
 
 	if (!collector_hdr->latch)
@@ -525,32 +542,54 @@ receive_array(SHMRequest request, Size item_size, Size *count)
 
 	SetLatch(collector_hdr->latch);
 
-	shm_mq_set_receiver(mq, MyProc);
-	mqh = shm_mq_attach(mq, NULL, NULL);
+	shm_mq_set_receiver(recv_mq, MyProc);
 
-	res = shm_mq_receive(mqh, &len, &data, false);
-	if (res != SHM_MQ_SUCCESS || len != sizeof(*count))
-		elog(ERROR, "Error reading mq.");
-	memcpy(count, data, sizeof(*count));
+	/*
+	 * We switch to TopMemoryContext, so that recv_mqh is allocated there
+	 * and is guaranteed to survive until before_shmem_exit callbacks are
+	 * fired.  Anyway, shm_mq_detach() will free handler on its own.
+	 *
+	 * NB: we do not pass `seg` to shm_mq_attach(), so it won't set its own
+	 * callback, i.e. we do not interfere here with shm_mq_detach_callback().
+	 */
+	oldctx = MemoryContextSwitchTo(TopMemoryContext);
+	recv_mqh = shm_mq_attach(recv_mq, NULL, NULL);
+	MemoryContextSwitchTo(oldctx);
 
-	result = palloc(item_size * (*count));
-	ptr = result;
-
-	for (i = 0; i < *count; i++)
+	/*
+	 * Now we surely attached to the shm_mq and got collector's attention.
+	 * If anything went wrong (e.g. Ctrl+C received from the client) we have
+	 * to cleanup some things, i.e. detach from the shm_mq, so collector was
+	 * able to continue responding to other requests.
+	 *
+	 * PG_ENSURE_ERROR_CLEANUP() guaranties that cleanup callback will be
+	 * fired for both ERROR and FATAL.
+	 */
+	PG_ENSURE_ERROR_CLEANUP(pgws_cleanup_callback, 0);
 	{
-		res = shm_mq_receive(mqh, &len, &data, false);
-		if (res != SHM_MQ_SUCCESS || len != item_size)
-			elog(ERROR, "Error reading mq.");
-		memcpy(ptr, data, item_size);
-		ptr += item_size;
+		res = shm_mq_receive(recv_mqh, &len, &data, false);
+		if (res != SHM_MQ_SUCCESS || len != sizeof(*count))
+			elog(ERROR, "error reading mq");
+
+		memcpy(count, data, sizeof(*count));
+
+		result = palloc(item_size * (*count));
+		ptr = result;
+
+		for (i = 0; i < *count; i++)
+		{
+			res = shm_mq_receive(recv_mqh, &len, &data, false);
+			if (res != SHM_MQ_SUCCESS || len != item_size)
+				elog(ERROR, "error reading mq");
+
+			memcpy(ptr, data, item_size);
+			ptr += item_size;
+		}
 	}
+	PG_END_ENSURE_ERROR_CLEANUP(pgws_cleanup_callback, 0);
 
-#if PG_VERSION_NUM >= 100000
-	shm_mq_detach(mqh);
-#else
-	shm_mq_detach(mq);
-#endif
-
+	/* We still have to detach and release lock during normal operation. */
+	shm_mq_detach_compat(recv_mqh, recv_mq);
 	LockRelease(&queueTag, ExclusiveLock, false);
 
 	return result;
@@ -583,7 +622,7 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 		funcctx->max_calls = profile->count;
 
 		/* Make tuple descriptor */
-		tupdesc = CreateTemplateTupleDesc(5, false);
+		tupdesc = CreateTemplateTupleDescCompat(5, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "type",
@@ -659,11 +698,11 @@ pg_wait_sampling_reset_profile(PG_FUNCTION_ARGS)
 
 	check_shmem();
 
-	init_lock_tag(&tag, false);
+	init_lock_tag(&tag, PGWS_QUEUE_LOCK);
 
 	LockAcquire(&tag, ExclusiveLock, false, false);
 
-	init_lock_tag(&tagCollector, true);
+	init_lock_tag(&tagCollector, PGWS_COLLECTOR_LOCK);
 	LockAcquire(&tagCollector, ExclusiveLock, false, false);
 	LockRelease(&tagCollector, ExclusiveLock, false);
 
@@ -701,7 +740,7 @@ pg_wait_sampling_get_history(PG_FUNCTION_ARGS)
 		funcctx->max_calls = history->count;
 
 		/* Make tuple descriptor */
-		tupdesc = CreateTemplateTupleDesc(5, false);
+		tupdesc = CreateTemplateTupleDescCompat(5, false);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pid",
 						   INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "sample_ts",
@@ -769,7 +808,11 @@ pg_wait_sampling_get_history(PG_FUNCTION_ARGS)
  * planner_hook hook, save queryId for collector
  */
 static PlannedStmt *
-pgws_planner_hook(Query *parse, int cursorOptions,
+pgws_planner_hook(Query *parse,
+#if PG_VERSION_NUM >= 130000
+				  const char *query_string,
+#endif
+				  int cursorOptions,
 				  ParamListInfo boundParams)
 {
 	if (MyProc)
@@ -793,9 +836,17 @@ pgws_planner_hook(Query *parse, int cursorOptions,
 
 	/* Invoke original hook if needed */
 	if (planner_hook_next)
-		return planner_hook_next(parse, cursorOptions, boundParams);
+		return planner_hook_next(parse,
+#if PG_VERSION_NUM >= 130000
+				query_string,
+#endif
+				cursorOptions, boundParams);
 
-	return standard_planner(parse, cursorOptions, boundParams);
+	return standard_planner(parse,
+#if PG_VERSION_NUM >= 130000
+				query_string,
+#endif
+			cursorOptions, boundParams);
 }
 
 /*
