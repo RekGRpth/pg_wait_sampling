@@ -1,18 +1,19 @@
 dist: jammy
 language: c
 env:
+- PG_MAJOR=17 BETA=1
 - PG_MAJOR=16
 - PG_MAJOR=15
 - PG_MAJOR=14
 - PG_MAJOR=13
 - PG_MAJOR=12
-- PG_MAJOR=11
 before_script:
 - curl https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
 - echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee -a /etc/apt/sources.list
+- if [ -n "${BETA}" ]; then echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main ${PG_MAJOR}" | sudo tee -a /etc/apt/sources.list; fi
 - sudo apt-get update
 - sudo systemctl stop postgresql
-- sudo apt-get install -y --no-install-recommends postgresql-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR}
+- sudo apt-get install -y --no-install-recommends postgresql-client-${PG_MAJOR} postgresql-${PG_MAJOR} postgresql-server-dev-${PG_MAJOR}
 - sudo systemctl stop postgresql
 script: ./run-tests.sh
 after_script:
