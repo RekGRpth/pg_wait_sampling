@@ -43,8 +43,13 @@ static bool shmem_initialized = false;
 
 /* Hooks */
 static ExecutorStart_hook_type	prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type 	prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type	prev_ExecutorEnd = NULL;
 static planner_hook_type		planner_hook_next = NULL;
+
+/* Current nesting depth of planner/Executor calls */
+static int nesting_level = 0;
 
 /* Pointers to shared memory objects */
 shm_mq				   *pgws_collector_mq = NULL;
@@ -67,6 +72,10 @@ static PlannedStmt *pgws_planner_hook(Query *parse,
 #endif
 		int cursorOptions, ParamListInfo boundParams);
 static void pgws_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void pgws_ExecutorRun(QueryDesc *queryDesc,
+							 ScanDirection direction,
+							 uint64 count, bool execute_once);
+static void pgws_ExecutorFinish(QueryDesc *queryDesc);
 static void pgws_ExecutorEnd(QueryDesc *queryDesc);
 
 /*
@@ -194,7 +203,8 @@ setup_gucs()
 				history_period_found = false,
 				profile_period_found = false,
 				profile_pid_found = false,
-				profile_queries_found = false;
+				profile_queries_found = false,
+				sample_cpu_found = false;
 
 	get_guc_variables_compat(&guc_vars, &numOpts);
 
@@ -236,6 +246,12 @@ setup_gucs()
 			var->_bool.variable = &pgws_collector_hdr->profileQueries;
 			pgws_collector_hdr->profileQueries = true;
 		}
+		else if (!strcmp(name, "pg_wait_sampling.sample_cpu"))
+		{
+			sample_cpu_found = true;
+			var->_bool.variable = &pgws_collector_hdr->sampleCpu;
+			pgws_collector_hdr->sampleCpu = true;
+		}
 	}
 
 	if (!history_size_found)
@@ -268,11 +284,18 @@ setup_gucs()
 				&pgws_collector_hdr->profileQueries, true,
 				PGC_SUSET, 0, shmem_bool_guc_check_hook, NULL, NULL);
 
+	if (!sample_cpu_found)
+		DefineCustomBoolVariable("pg_wait_sampling.sample_cpu",
+		                         "Sets whether not waiting backends should be sampled.", NULL,
+		                         &pgws_collector_hdr->sampleCpu, true,
+		                         PGC_SUSET, 0, shmem_bool_guc_check_hook, NULL, NULL);
+
 	if (history_size_found
 		|| history_period_found
 		|| profile_period_found
 		|| profile_pid_found
-		|| profile_queries_found)
+		|| profile_queries_found
+	    || sample_cpu_found)
 	{
 		ProcessConfigFile(PGC_SIGHUP);
 	}
@@ -395,6 +418,10 @@ _PG_init(void)
 	planner_hook			= pgws_planner_hook;
 	prev_ExecutorStart		= ExecutorStart_hook;
 	ExecutorStart_hook		= pgws_ExecutorStart;
+	prev_ExecutorRun		= ExecutorRun_hook;
+	ExecutorRun_hook		= pgws_ExecutorRun;
+	prev_ExecutorFinish		= ExecutorFinish_hook;
+	ExecutorFinish_hook		= pgws_ExecutorFinish;
 	prev_ExecutorEnd		= ExecutorEnd_hook;
 	ExecutorEnd_hook		= pgws_ExecutorEnd;
 }
@@ -423,6 +450,28 @@ search_proc(int pid)
 	ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 					errmsg("backend with pid=%d not found", pid)));
 	return NULL;
+}
+
+/*
+ * Decide whether this PGPROC entry should be included in profiles and output
+ * views.
+ */
+bool
+pgws_should_sample_proc(PGPROC *proc)
+{
+	if (proc->wait_event_info == 0 && !pgws_collector_hdr->sampleCpu)
+		return false;
+
+	/*
+	 * On PostgreSQL versions < 17 the PGPROC->pid field is not reset on
+	 * process exit. This would lead to such processes getting counted for
+	 * null wait events. So instead we make use of DisownLatch() resetting
+	 * owner_pid during ProcKill().
+	 */
+	if (proc->pid == 0 || proc->procLatch.owner_pid == 0 || proc->pid == MyProcPid)
+		return false;
+
+	return true;
 }
 
 typedef struct
@@ -490,13 +539,13 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 			{
 				PGPROC *proc = &ProcGlobal->allProcs[i];
 
-				if (proc != NULL && proc->pid != 0 && proc->wait_event_info)
-				{
-					params->items[j].pid = proc->pid;
-					params->items[j].wait_event_info = proc->wait_event_info;
-					params->items[j].queryId = pgws_proc_queryids[i];
-					j++;
-				}
+				if (!pgws_should_sample_proc(proc))
+					continue;
+
+				params->items[j].pid = proc->pid;
+				params->items[j].wait_event_info = proc->wait_event_info;
+				params->items[j].queryId = pgws_proc_queryids[i];
+				j++;
 			}
 			funcctx->max_calls = j;
 		}
@@ -865,27 +914,41 @@ pgws_planner_hook(Query *parse,
 				  int cursorOptions,
 				  ParamListInfo boundParams)
 {
-	if (MyProc)
+	PlannedStmt *result;
+	int i = MyProc - ProcGlobal->allProcs;
+	if (nesting_level == 0)
+		pgws_proc_queryids[i] = parse->queryId;
+
+	nesting_level++;
+	PG_TRY();
 	{
-		int i = MyProc - ProcGlobal->allProcs;
-		if (!pgws_proc_queryids[i])
-			pgws_proc_queryids[i] = parse->queryId;
-
+		/* Invoke original hook if needed */
+		if (planner_hook_next)
+			result = planner_hook_next(parse,
+#if PG_VERSION_NUM >= 130000
+					query_string,
+#endif
+					cursorOptions, boundParams);
+		else
+			result = standard_planner(parse,
+#if PG_VERSION_NUM >= 130000
+					query_string,
+#endif
+					cursorOptions, boundParams);
+		nesting_level--;
+		if (nesting_level == 0)
+			pgws_proc_queryids[i] = UINT64CONST(0);
 	}
+	PG_CATCH();
+	{
+		nesting_level--;
+		if (nesting_level == 0)
+			pgws_proc_queryids[i] = UINT64CONST(0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	/* Invoke original hook if needed */
-	if (planner_hook_next)
-		return planner_hook_next(parse,
-#if PG_VERSION_NUM >= 130000
-				query_string,
-#endif
-				cursorOptions, boundParams);
-
-	return standard_planner(parse,
-#if PG_VERSION_NUM >= 130000
-				query_string,
-#endif
-			cursorOptions, boundParams);
+	return result;
 }
 
 /*
@@ -894,19 +957,56 @@ pgws_planner_hook(Query *parse,
 static void
 pgws_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
-	int 		i;
-
-	if (MyProc)
-	{
-		i = MyProc - ProcGlobal->allProcs;
-		if (!pgws_proc_queryids[i])
-			pgws_proc_queryids[i] = queryDesc->plannedstmt->queryId;
-	}
+	int i = MyProc - ProcGlobal->allProcs;
+	if (nesting_level == 0)
+		pgws_proc_queryids[i] = queryDesc->plannedstmt->queryId;
 
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+pgws_ExecutorRun(QueryDesc *queryDesc,
+				ScanDirection direction,
+				uint64 count, bool execute_once)
+{
+	nesting_level++;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count, execute_once);
+		else
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		nesting_level--;
+	}
+	PG_CATCH();
+	{
+		nesting_level--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+
+static void
+pgws_ExecutorFinish(QueryDesc *queryDesc)
+{
+	nesting_level++;
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+		nesting_level--;
+	}
+	PG_CATCH();
+	{
+		nesting_level--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -915,8 +1015,9 @@ pgws_ExecutorStart(QueryDesc *queryDesc, int eflags)
 static void
 pgws_ExecutorEnd(QueryDesc *queryDesc)
 {
-	if (MyProc)
-		pgws_proc_queryids[MyProc - ProcGlobal->allProcs] = UINT64CONST(0);
+	int i = MyProc - ProcGlobal->allProcs;
+	if (nesting_level == 0)
+		pgws_proc_queryids[i] = UINT64CONST(0);
 
 	if (prev_ExecutorEnd)
 		prev_ExecutorEnd(queryDesc);

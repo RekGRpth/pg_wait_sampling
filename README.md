@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.com/postgrespro/pg_wait_sampling.svg?branch=master)](https://travis-ci.com/postgrespro/pg_wait_sampling)
+[![Build Status](https://app.travis-ci.com/postgrespro/pg_wait_sampling.svg?branch=master)](https://app.travis-ci.com/postgrespro/pg_wait_sampling)
 [![GitHub license](https://img.shields.io/badge/license-PostgreSQL-blue.svg)](https://raw.githubusercontent.com/postgrespro/pg_wait_sampling/master/LICENSE)
 
 `pg_wait_sampling` – sampling based statistics of wait events
@@ -133,13 +133,14 @@ in-memory hash table.
 The work of wait event statistics collector worker is controlled by following
 GUCs.
 
-|         Parameter name              | Data type |                  Description                | Default value |
-| ----------------------------------- | --------- | ------------------------------------------- | ------------: |
-| pg_wait_sampling.history_size       | int4      | Size of history in-memory ring buffer       |          5000 |
-| pg_wait_sampling.history_period     | int4      | Period for history sampling in milliseconds |            10 |
-| pg_wait_sampling.profile_period     | int4      | Period for profile sampling in milliseconds |            10 |
-| pg_wait_sampling.profile_pid        | bool      | Whether profile should be per pid           |          true |
-| pg_wait_sampling.profile_queries    | bool      | Whether profile should be per query			|          true |
+| Parameter name                   | Data type | Description                                 | Default value |
+|----------------------------------| --------- |---------------------------------------------|--------------:|
+| pg_wait_sampling.history_size    | int4      | Size of history in-memory ring buffer       |          5000 |
+| pg_wait_sampling.history_period  | int4      | Period for history sampling in milliseconds |            10 |
+| pg_wait_sampling.profile_period  | int4      | Period for profile sampling in milliseconds |            10 |
+| pg_wait_sampling.profile_pid     | bool      | Whether profile should be per pid           |          true |
+| pg_wait_sampling.profile_queries | bool      | Whether profile should be per query         |          true |
+| pg_wait_sampling.sample_cpu      | bool      | Whether on CPU backends should be sampled   |          true |
 
 If `pg_wait_sampling.profile_pid` is set to false, sampling profile wouldn't be
 collected in per-process manner.  In this case the value of pid could would
@@ -147,6 +148,10 @@ be always zero and corresponding row contain samples among all the processes.
 
 While `pg_wait_sampling.profile_queries` is set to false `queryid` field in
 views will be zero.
+
+If `pg_wait_sampling.sample_cpu` is set to true then processes that are not
+waiting on anything are also sampled. The wait event columns for such processes
+will be NULL.
 
 These GUCs are allowed to be changed by superuser.  Also, they are placed into
 shared memory.  Thus, they could be changed from any backend and affects worker
