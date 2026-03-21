@@ -524,6 +524,7 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "queryid",
 						   INT8OID, -1, 0);
+		TupleDescFinalize(tupdesc);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
@@ -757,6 +758,7 @@ pg_wait_sampling_get_profile(PG_FUNCTION_ARGS)
 						   INT8OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "count",
 						   INT8OID, -1, 0);
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		MemoryContextSwitchTo(oldcontext);
@@ -882,6 +884,7 @@ pg_wait_sampling_get_history(PG_FUNCTION_ARGS)
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "queryid",
 						   INT8OID, -1, 0);
+		TupleDescFinalize(tupdesc);
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		MemoryContextSwitchTo(oldcontext);
