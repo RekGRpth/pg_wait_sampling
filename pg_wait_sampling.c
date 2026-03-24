@@ -527,7 +527,6 @@ pg_wait_sampling_get_current(PG_FUNCTION_ARGS)
 #if PG_VERSION_NUM >= 190000
 		TupleDescFinalize(tupdesc);
 #endif
-
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
 		LWLockAcquire(ProcArrayLock, LW_SHARED);
