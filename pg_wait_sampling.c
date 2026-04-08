@@ -269,9 +269,6 @@ pgws_shmem_startup(void)
 	if (!found)
 	{
 		/* Create shared objects */
-		queue_lock = &(GetNamedLWLockTranche(PGWS_QUEUE_LOCK_NAME))->lock;
-		collector_lock = &(GetNamedLWLockTranche(PGWS_COLLECTOR_LOCK_NAME))->lock;
-
 		toc = shm_toc_create(PG_WAIT_SAMPLING_MAGIC, pgws, segsize);
 
 		pgws_collector_hdr = shm_toc_allocate(toc, sizeof(CollectorShmqHeader));
